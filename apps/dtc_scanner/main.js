@@ -13,7 +13,14 @@
  *           coolant and the service items (KombiInterface_2 cbsDataServiceList, as the Service app reads them) on
  *           one plain-text report for a phone camera; read while the page shows, like Check Control.
  *
- * Pages: faults (6 per page) -> Check Control -> control units that answered. Where the kit runs the
+ * Fault details (a fault tapped, or Fault details): what the unit stored with it, read then from that unit alone
+ *           (fault_context.js: 19 03 / 19 04 / 19 06, reads only): the status bits in words, the snapshot records and
+ *           extended data records. BMW doesn't publish what they hold and the repo has no table for them, so they
+ *           show as bytes, never named by a guess.
+ *   Response times: how fast each unit answered this app and our own requests per second (timing.js); the real
+ *           bus load is not visible to an app.
+ *
+ * Pages: faults (6 per page) -> Check Control -> control units that answered -> response times. Where the kit runs the
  * screen, all the faults are on one page and each list scrolls (a finger, or the controller turned on it).
  * Fault codes are BMW hex codes (as BMW's diagnostic tools show them); the head unit has no
  * text database for them, so look them up by code + control unit.
@@ -28,6 +35,8 @@ const { diagnosticText } = require('./diagnostic-text');
 const { t: translateUI, plural } = require('./kit/i18n');
 const { Diag, parseDtcReply, statusInfo, hex, NRC } = require('./kit/diag');
 const DEMO = require('./demo');
+const FC = require('./fault_context');
+const { Timing, wrap: timeDiag, demoView } = require('./timing');
 
 const W = 1600, H = 520, PER_PAGE = 6;
 const GO = '#2fd27a';
@@ -104,7 +113,8 @@ mgu.run({
         // shown, the Check Control watches run only while it shows (watching the cluster's interface disturbed
         // another app), and a scan left half way stops after the request under way
         let diag = null, diagReady = null, away = true;
-        const getDiag = () => diagReady || (diagReady = new Diag(ctx.signals, log).init().then((d) => { diag = d; changed(); return d; }));
+        const timing = new Timing();
+        const getDiag = () => diagReady || (diagReady = new Diag(ctx.signals, log).init().then((d) => { diag = timeDiag(d, timing); changed(); return d; }));
 
         /* ---------- state ---------- */
         const FILE = path.join(ctx.dataDir, 'last_scan.json');
@@ -367,6 +377,52 @@ mgu.run({
             changed();
         }
 
+        /* ---------- fault details ---------- */
+        // the fault opened: { addr, code, mem, status, phase: 'reading' | 'done' | 'error', ctx, msg, step }
+        let detail = null, rawOpen = false;
+        async function openDetail(d) {
+            if (!d || busy) return;
+            const mine = { addr: d.addr, code: d.code, mem: d.mem, status: d.status, phase: 'reading', ctx: null, msg: '', step: 0 };
+            detail = mine; rawOpen = false; changed();
+            try {
+                if (scan && scan.demo) {
+                    await new Promise((r) => setTimeout(r, 400));
+                    mine.ctx = FC.demoContext(d.code, d.status);
+                } else {
+                    await getDiag();
+                    mine.ctx = await FC.readContext(diag, d.addr, d.code, { onStep: (n) => { mine.step = n; changed(); } });
+                    log.info('fault ' + d.code + ' at ' + hex(d.addr) + ': ' + mine.ctx.snapshots.length + ' snapshot(s), ' + mine.ctx.extended.length
+                        + ' extended record(s), ' + mine.ctx.requests + ' requests' + (mine.ctx.noAnswer ? ', no answer' : ''));
+                }
+                rawLines(mine.ctx).forEach((v) => log.info('  ' + d.code + ' ' + v.head + ': ' + v.body));
+                mine.phase = 'done';
+            } catch (e) {
+                log.warn('fault details: ' + e);
+                mine.phase = 'error'; mine.msg = String(e.message || e);
+            }
+            changed();
+        }
+        const closeDetail = () => { detail = null; changed(); };
+        /** what the unit stored, one line per value: { head, body } (shown raw; no table names them) */
+        function rawLines(c) {
+            const out = [];
+            if (!c) return out;
+            c.snapshots.forEach((sn) => {
+                sn.values.forEach((v) => out.push({ head: 'Snapshot ' + sn.rec + ', value 0x' + hex(v.did, 4), body: v.bytes ? FC.rawText(v.bytes) : 'length not known' }));
+                if (sn.rest) out.push({ head: 'Snapshot ' + sn.rec + ', ' + (sn.count - 1) + ' more value' + (sn.count === 2 ? '' : 's') + ' together', body: FC.rawText(sn.rest) });
+            });
+            c.extended.forEach((e) => out.push({ head: 'Extra record ' + hex(e.rec), body: FC.rawText(e.bytes) }));
+            return out;
+        }
+        /** Fault details on the next fault (the first of the page shown when none is open). */
+        function nextDetail() {
+            const l = listed();
+            if (!l.length) { msg = scan ? 'No faults to show' : 'Scan first'; changed(); return; }
+            const i = detail ? l.findIndex((d) => d.addr === detail.addr && d.code === detail.code && d.mem === detail.mem) : -1;
+            const first = scrolls ? 0 : Math.min(page, Math.max(0, pageCount() - 4)) * perPage;     // (fault pages: pageCount() - 3)
+            openDetail(i >= 0 ? l[(i + 1) % l.length] : l[Math.min(first, l.length - 1)]);
+        }
+
         /* ---------- drawing ---------- */
         let page = 0;
         let perPage = PER_PAGE;          // faults on a page: one more where the screen has room below the page (render)
@@ -436,8 +492,8 @@ mgu.run({
                     help: ['Point the phone camera at the code:', 'it reads as plain text, no app needed.', 'Several pages: one photo each.'] }),
             });
         }
-        const pageCount = () => (scrolls ? 1 : Math.max(1, Math.ceil(listed().length / perPage))) + 2;
-        const shownList = () => { const fp = pageCount() - 2; return page < fp ? scroll.faults : page === fp ? scroll.cc : scroll.ecus; };
+        const pageCount = () => (scrolls ? 1 : Math.max(1, Math.ceil(listed().length / perPage))) + 3;
+        const shownList = () => { const fp = pageCount() - 3; return page < fp ? scroll.faults : page === fp ? scroll.cc : scroll.ecus; };
         // a finger dragged on the page or the controller turned on it (cv.scroll): the list shown moves
         ctx.onScroll((dy) => {
             const s = shownList(), y = G.clamp(s.y + dy, 0, s.max), moved = y !== s.y;
@@ -464,8 +520,8 @@ mgu.run({
 
         /** G20-style frame: tab bar with the page names along the top (fault pages share one tab). */
         function header(cv, t) {
-            const fp = pageCount() - 2, sel = page < fp ? 0 : page === fp ? 1 : 2;
-            G.frame(cv, t, ['Faults' + (fp > 1 ? '  ' + (Math.min(page, fp - 1) + 1) + '/' + fp : ''), 'Check Control', 'Control units'], sel,
+            const fp = pageCount() - 3, sel = page < fp ? 0 : page - fp + 1;
+            G.frame(cv, t, ['Faults' + (fp > 1 ? '  ' + (Math.min(page, fp - 1) + 1) + '/' + fp : ''), 'Check Control', 'Control units', 'Response times'], sel,
                 [(scan && scan.demo || (!scan && useDemo())) && { text: 'DEMO' }]);
         }
 
@@ -564,6 +620,8 @@ mgu.run({
                 const diagnosticOptions = { literal: true };
                 if (txt) cv.text(fit(cv, txt, 22, 1552 - 680, diagnosticOptions), 680, y + 27, 22, t.dim, diagnosticOptions);
                 if (i < rows.length - 1) cv.fillRect(48, y + 40, 1504, 1, withAlpha(t.tick, 0.25));
+                const ty = Math.max(y, from || 0), th = Math.min(y + 40, to || 9999) - ty;
+                if (cv.own && th >= 20) cv.target(48, ty, 1504, th, () => openDetail(d), 'fault' + d.addr + d.code + d.mem, 6);
             }));
         }
 
@@ -608,23 +666,152 @@ mgu.run({
             }));
         }
 
+        /** text cut into lines of at most w px (at most max lines; the last one cut with "...") */
+        function wrapLines(cv, txt, size, w, max, opt) {
+            const words = String(txt || '').split(/\s+/), lines = [];
+            let cur = '';
+            words.forEach((wd) => {
+                const next = cur ? cur + ' ' + wd : wd;
+                if (cur && cv.textWidth(next, size, opt) > w) { lines.push(cur); cur = wd; } else cur = next;
+            });
+            if (cur) lines.push(cur);
+            if (lines.length > max) { lines.length = max; lines[max - 1] = fit(cv, lines[max - 1] + ' ...', size, w, opt); }
+            return lines;
+        }
+
+        /** Fault details: the fault and its status bits on the left, what the unit stored with it on the right. */
+        function drawDetail(cv, t) {
+            const dt = detail, s = statusInfo(dt.status), col = t[s.sev] || t.dim;
+            const L = G.panel(cv, t, 24, 44, 720, 468, 'Fault ' + dt.code);
+            let bx = 42 + cv.textWidth('Fault ' + dt.code, 26, { font: 'bold' }) + 24;
+            bx += G.button(cv, t, bx, 57, 0, 40, 'Back', closeDetail, { key: 'back' }) + 12;
+            G.button(cv, t, bx, 57, 0, 40, 'Next fault', nextDetail, { key: 'nextfault', busy: dt.phase === 'reading' });
+            cv.text(fit(cv, ecuName(dt.addr) + '  (0x' + hex(dt.addr) + ')', 24, 660), 48, 136, 24, t.text, { font: 'bold' });
+            const desc = describe(dt.addr, dt.code);
+            const dopt = { literal: true };
+            wrapLines(cv, desc ? diagnosticText(desc) : 'No text known for this code on this unit type', 20, 660, 2, dopt)
+                .forEach((ln, i) => cv.text(ln, 48, 168 + i * 26, 20, desc ? t.dim : withAlpha(t.dim, 0.7), dopt));
+            G.pill(cv, t, 48, 214, 200, 32, s.label + (dt.mem === 'info' ? ' INFO' : ''), { color: col, size: 17 });
+            cv.text('status byte 0x' + hex(dt.status) + ', as the unit reports it:', 266, 237, 17, t.dim);
+            FC.statusBits(dt.status).forEach((b, i) => {
+                const y = 262 + i * 30, on = b.on, c = on ? (b.bit === 0x01 || b.bit === 0x80 ? t.crit : b.bit === 0x08 || b.bit === 0x04 ? t.warn : t.accent) : t.dim;
+                if (on) cv.circle(60, y + 9, 8, c); else cv.arc(60, y + 9, 6.5, 8, 0, 360, withAlpha(t.dim, 0.6));
+                cv.text(b.label, 80, y + 16, 19, on ? t.text : withAlpha(t.dim, 0.8), on ? { font: 'bold' } : undefined);
+                cv.text(on ? 'yes' : 'no', L.x + L.w - 24, y + 16, 18, on ? c : withAlpha(t.dim, 0.8), { align: 'right', font: 'bold' });
+            });
+
+            const R = G.panel(cv, t, 760, 44, 816, 468, 'Stored with the fault');
+            const c = dt.ctx;
+            if (dt.phase === 'reading') {
+                const w = 360, f = ((Date.now() / 1200) % 1);
+                cv.roundRect(784, 140, w, 8, 4, t.track);
+                cv.roundRect(784 + f * (w - 80), 140, 80, 8, 4, t.accent);
+                cv.text('Asking ' + ecuName(dt.addr) + '... request ' + (dt.step || 1), 784, 186, 22, t.text);
+                cv.text('A few requests to this unit alone: which records it keeps, then each one.', 784, 222, 19, t.dim);
+                return;
+            }
+            if (dt.phase === 'error') { cv.text('Could not read: ' + dt.msg, 784, 150, 22, t.crit); return; }
+            if (c.noAnswer) {
+                cv.text('The unit did not answer (asleep, or busy).', 784, 150, 22, t.text);
+                cv.text('Ignition on, then Next fault and back, or Read it again later.', 784, 184, 19, t.dim);
+                return;
+            }
+            const values = rawLines(c);
+            const tilesR = [['SNAPSHOTS', c.snapshots.length, 'moments the unit kept'], ['EXTRA RECORDS', c.extended.length, 'counters and the like'],
+                ['VALUES NAMED', 0, 'of ' + values.length + ': no table']];
+            tilesR.forEach((x, i) => {
+                const tx = 784 + i * 262;
+                cv.text(x[0], tx, 116, 15, t.dim, { font: 'bold', spacing: 2 });
+                cv.text(String(x[1]), tx, 166, 48, i === 2 ? t.dim : t.text, { font: 'num' });
+                cv.text(x[2], tx + cv.textWidth(String(x[1]), 48, { font: 'num' }) + 12, 164, 17, t.dim);
+            });
+            if (!values.length) {
+                cv.text('The unit keeps nothing extra with this fault' + (Object.keys(c.refused).length ? ' (it refused the question)' : '') + '.', 784, 226, 21, t.text);
+                return;
+            }
+            let y = 196;
+            const ser = FC.series(c.snapshots);
+            if (ser.length && !(cv.own && rawOpen)) {     // (raw values open: the room goes to them)
+                // one identifier over the snapshots: its numbers as bars, so a change from one to the next shows
+                const sr = ser[0], vals = sr.points.map((p) => p.value), lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+                const pad = Math.max(1, (hi - lo) * 0.25), step = G.niceStep(hi - lo + 2 * pad, 2);
+                const y0 = Math.floor((lo - pad) / step) * step, y1 = Math.ceil((hi + pad) / step) * step;
+                cv.text('Value 0x' + hex(sr.did, 4) + ' in each snapshot: raw number, what it measures is not known', 784, y + 12, 17, t.dim);
+                const ch = G.chart(cv, t, 776, y + 24, 780, 100, { xMin: sr.points[0].rec, xMax: sr.points[sr.points.length - 1].rec, xStep: 1, yMin: y0, yMax: y1, yStep: step,
+                    xFmt: (v) => 'snapshot ' + v, yFmt: (v) => String(Math.round(v)), padLeft: 150, padRight: 90,
+                    series: [{ pts: sr.points.map((p) => [p.rec, p.value]), color: t.accent, width: 3 }] });
+                sr.points.forEach((p) => {
+                    const px = ch.X(p.rec), py = ch.Y(p.value);
+                    cv.circle(px, py, 7, t.accent);
+                    cv.text(String(p.value), px, py - 12, 16, t.text, { align: 'center', font: 'bold' });
+                });
+                y += 138;
+            }
+            if (cv.own) {
+                G.button(cv, t, 784, y, 0, 36, rawOpen ? 'Hide raw values' : 'Show raw values (' + values.length + ')', () => { rawOpen = !rawOpen; changed(); }, { key: 'raw' });
+                y += 44;
+            }
+            const rows = cv.own && !rawOpen ? [] : values.slice(0, Math.max(0, Math.floor((486 - y) / 28)));
+            rows.forEach((v, i) => {
+                cv.text(fit(cv, v.head, 17, 330), 784, y + 20 + i * 28, 17, t.text, { font: 'bold' });
+                cv.text(fit(cv, v.body, 17, 440), 1124, y + 20 + i * 28, 17, t.dim);
+            });
+            if (rows.length < values.length && (!cv.own || rawOpen)) cv.text('+ ' + (values.length - rows.length) + ' more in the log', 1552, 486, 16, t.dim, { align: 'right' });
+            cv.text('BMW does not publish what these hold, so they show as bytes: nothing is named by a guess.', 784, 504, 16, t.dim);
+        }
+
+        /** Response times: how fast each unit answered us, and our own requests per second. */
+        function drawBus(cv, t) {
+            const v = scan && scan.demo || (!scan && useDemo()) ? demoView(DEMO.ecus.map((e) => e.addr)) : timing.view();
+            tile(cv, t, 0, 'Requests sent', String(v.sent), 'by this app', t.text);
+            tile(cv, t, 1, 'Replies', String(v.answered), 'one per unit asked', GO);
+            tile(cv, t, 2, 'No answer', String(v.missed), 'timed out', v.missed ? t.warn : GO);
+            tile(cv, t, 3, 'Waits', String(v.waits), '"pending" replies', v.waits ? t.warn : t.text);
+            const L = G.panel(cv, t, 24, 176, 900, 336, 'How fast each unit answers us');
+            const units = v.units.filter((u) => u.n).slice(0, 6);
+            if (!units.length) { cv.text('No requests yet: Scan now, or open a fault', 48, 300, 24, t.dim); }
+            const top = Math.max(200, ...units.map((u) => u.max || 0)), X = (ms) => 330 + 470 * Math.min(1, ms / top);
+            units.forEach((u, i) => {
+                const y = 232 + i * 44;
+                cv.text(fit(cv, ecuName(u.addr), 19, 270), 48, y + 20, 19, t.text);
+                cv.roundRect(330, y + 6, 470, 18, 6, t.track);
+                cv.roundRect(330, y + 6, Math.max(8, X(u.avg) - 330), 18, 6, u.avg > 150 ? t.warn : t.accent);
+                cv.fillRect(Math.round(X(u.max)) - 2, y + 1, 4, 28, t.crit);
+                if (u.last !== null) { cv.circle(X(u.last), y + 15, 8, t.bg); cv.circle(X(u.last), y + 15, 5.5, t.warn); }
+                cv.text(Math.round(u.avg) + ' ms', 896, y + 21, 18, t.text, { align: 'right', font: 'bold' });
+            });
+            cv.text('bar: average    red line: slowest    yellow dot: the last answer', 48, 500, 16, t.dim);
+            const R = G.panel(cv, t, 940, 176, 636, 336, 'Our requests per second, last 60 s');
+            const ymax = Math.max(4, ...v.perSec);
+            G.chart(cv, t, 956, 226, 604, 200, { xMin: -60, xMax: 0, yMin: 0, yMax: ymax, xStep: 15, yStep: ymax > 8 ? Math.ceil(ymax / 4) : 1, xUnit: 's',
+                series: [{ pts: v.perSec.map((n, i) => [i - 59, n]), color: t.accent, width: 2.5, fill: 0.2 }] });
+            wrapLines(cv, 'The real load on the car\'s buses is not visible to an app: this shows how fast units answer us and how many requests we send.', 16, 588, 3)
+                .forEach((ln, i) => cv.text(ln, 964, 452 + i * 22, 16, t.dim));
+            void R; void L;
+        }
+
         let drawn = -1;
         async function render(force) {
-            if (!force && drawn === version && !gliding && phase !== 'scanning' && phase !== 'clearing') return;
+            if (!force && drawn === version && !gliding && phase !== 'scanning' && phase !== 'clearing' && !(detail && detail.phase === 'reading')
+                && !(page === pageCount() - 1)) return;
             drawn = version;
             gliding = false;
             const t = ctx.theme();
             const cv = ctx.canvas(W, H).clear(t.bg);
-            const fp0 = pageCount() - 2;
+            const fp0 = pageCount() - 3;
             scrolls = !!cv.own;
             perPage = PER_PAGE + Math.floor((G.pageBottom(cv) - G.BOTTOM) / 47);     // rows of 47 px (drawCC; drawFaults' are 46)
-            const fp = pageCount() - 2;
+            const fp = pageCount() - 3;
             // fewer or more fault pages now (the room below the page came or went): Check Control and Control
             // units stay the pages shown
             if (fp !== fp0) page = page >= fp0 ? fp + page - fp0 : Math.min(page, fp - 1);
             page = Math.min(page, pageCount() - 1);
-            tiles(cv, t);
-            if (page < fp) drawFaults(cv, t); else if (page === fp) drawCC(cv, t); else drawEcus(cv, t);
+            if (page < fp && detail) drawDetail(cv, t);
+            else if (page === fp + 2) drawBus(cv, t);
+            else {
+                tiles(cv, t);
+                if (page < fp) drawFaults(cv, t); else if (page === fp) drawCC(cv, t); else drawEcus(cv, t);
+            }
             header(cv, t);
             await ui.image('MAIN_GFX', cv);
         }
@@ -635,11 +822,13 @@ mgu.run({
         ctx.hideButton('BTN_SCAN');
         ctx.hideButton('BTN_CLEAR');
         ctx.onLayout(changed);           // (it draws only on changes: a new layout is one)
-        ui.onClick('BTN_PAGE', () => { page = (page + 1) % pageCount(); changed(); });
+        ui.onClick('BTN_PAGE', () => { if (detail) { closeDetail(); return; } page = (page + 1) % pageCount(); changed(); });
+        ui.onClick('BTN_DETAIL', () => { const fp = pageCount() - 3; if (page >= fp) page = 0; nextDetail(); });
         // tabs: Faults (opened again: its next page of faults), Check Control, Control units
         ctx.onTab((i) => {
-            const fp = pageCount() - 2;
-            if (i === 0 && page < fp) page = (page + 1) % fp;
+            const fp = pageCount() - 3;
+            if (i === 0 && detail) detail = null;
+            else if (i === 0 && page < fp) page = (page + 1) % fp;
             else page = i === 0 ? 0 : fp + i - 1;
             changed();
         });
